@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RootNamespace>Csaver.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="MSTest.TestAdapter" />
+    <PackageReference Include="MSTest.TestFramework" />
+    <ProjectReference Include="..\..\src\Csaver.Core\Csaver.Core.csproj" />
+    <ProjectReference Include="..\..\src\Csaver.Application\Csaver.Application.csproj" />
+    <ProjectReference Include="..\..\src\Csaver.Windows\Csaver.Windows.csproj" />
+  </ItemGroup>
+</Project>
