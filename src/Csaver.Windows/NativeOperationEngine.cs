@@ -297,6 +297,53 @@ public sealed class NativeOperationEngine : IOperationEngine
         }
     }
 
+    private static void EnsureSourceMovable(string source, CancellationToken cancellationToken)
+    {
+        var pending = new Stack<string>();
+        pending.Push(source);
+        while (pending.Count > 0)
+        {
+            var directory = pending.Pop();
+            foreach (var path in Directory.EnumerateFileSystemEntries(directory))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException($"Unsafe reparse point in source tree '{path}'; declare it under TrustedReparsePoints or remove it before migrating.");
+                if ((attributes & FileAttributes.Directory) != 0) { pending.Push(path); continue; }
+                FileStream? handle = null;
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    try { handle = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None); break; }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        if (attempt == 2)
+                            throw new IOException($"Source file '{path}' is locked or unreadable: {ex.Message}. Close the application using this directory (for example Trae CN) before migrating.", ex);
+                        Thread.Sleep(100);
+                    }
+                }
+                handle?.Dispose();
+            }
+        }
+    }
+
+    private static void ClearReadOnlyAttributes(string root)
+    {
+        var pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            var directory = pending.Pop();
+            foreach (var path in Directory.EnumerateFileSystemEntries(directory))
+            {
+                var attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReparsePoint) != 0) continue;
+                if ((attributes & FileAttributes.Directory) != 0) { pending.Push(path); continue; }
+                if ((attributes & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+            }
+        }
+    }
+
     private void ExecuteMigration(OperationRequest request, List<ResolvedMigrationTask> tasks, OperationResult result, HistoryService history, IProgress<OperationProgress>? progress, CancellationToken cancellationToken)
     {
         var inspector = new TaskInspectionService(junctions, trees);
@@ -344,6 +391,9 @@ public sealed class NativeOperationEngine : IOperationEngine
             {
                 journals.Create(journalPath, journal);
                 journals.Transition(journalPath, journal, "Copying");
+                // Fail before copying and before attaching snapshots to the journal, so a
+                // locked source stays recoverable instead of becoming a post-cutover refusal.
+                EnsureSourceMovable(task.Source, cancellationToken);
                 progress?.Report(Progress(request, task, "Copying", "Copying without deleting destination-only data."));
                 trees.CopyPreserving(task.Source, task.Destination, progress, request.OperationId, task.TaskId, cancellationToken);
                 journals.Transition(journalPath, journal, "Copied");
@@ -362,14 +412,21 @@ public sealed class NativeOperationEngine : IOperationEngine
                 cancellationToken.ThrowIfCancellationRequested();
                 progress?.Report(Progress(request, task, "Cutover", "Entering non-cancellable Junction cutover.", true));
                 Directory.CreateDirectory(stageParent);
-                Directory.Move(task.Source, stagePayload);
+                try { Directory.Move(task.Source, stagePayload); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                { throw new IOException($"Cannot stage source '{task.Source}' to '{stagePayload}': {ex.Message}. Close applications using the source directory before retrying.", ex); }
                 journals.Transition(journalPath, journal, "SourceStaged");
                 junctions.Create(task.Source, task.Destination);
                 journals.Transition(journalPath, journal, "JunctionCreated");
                 var link = junctions.Inspect(task.Source);
                 if (!link.IsJunction || !PathsEqual(link.Target, task.Destination)) throw new IOException("Final Junction validation failed.");
                 journals.Transition(journalPath, journal, "LinkValidated");
-                Directory.Delete(stagePayload, true);
+                // Read-only files would make the recursive staging cleanup fail with only a
+                // file name in the exception; clear them and report the full path if it still fails.
+                ClearReadOnlyAttributes(stagePayload);
+                try { Directory.Delete(stagePayload, true); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                { throw new IOException($"Cannot remove staged copy '{stagePayload}': {ex.Message}. The Junction was created and validated; close the locking application and remove this staging folder manually.", ex); }
                 if (Directory.Exists(stageParent)) Directory.Delete(stageParent, true);
                 journals.Transition(journalPath, journal, "Committed", retryable: false);
                 row.Status = "OK"; row.TransactionState = "Committed"; row.Retryable = false;

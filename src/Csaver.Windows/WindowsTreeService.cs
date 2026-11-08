@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using Csaver.Core;
@@ -6,6 +8,13 @@ namespace Csaver.Windows;
 
 public sealed class WindowsTreeService : ITreeService
 {
+    private const uint DaclSecurityInformation = 0x00000004;
+    private const uint ProtectedDaclSecurityInformation = 0x80000000;
+
+    [DllImport("advapi32.dll", EntryPoint = "SetFileSecurityW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileSecurity(string fileName, uint securityInformation, byte[] securityDescriptor);
+
     public DirectoryStatistics GetStatistics(string root, CancellationToken cancellationToken = default)
     {
         long count = 0;
@@ -142,7 +151,7 @@ public sealed class WindowsTreeService : ITreeService
             {
                 var parent = Path.GetDirectoryName(target);
                 if (parent is not null) Directory.CreateDirectory(parent);
-                File.Copy(path, target, true);
+                CopyFileOverwriting(path, target);
                 files.Add((path, target));
                 copied++;
                 if (copied % 100 == 0) progress?.Report(new OperationProgress { OperationId = operationId, TaskId = taskId, Stage = "Copying", Message = $"Copied {copied:N0} files" });
@@ -215,6 +224,44 @@ public sealed class WindowsTreeService : ITreeService
         });
     }
 
+    private static void CopyFileOverwriting(string source, string destination)
+    {
+        try
+        {
+            if (File.Exists(destination))
+            {
+                var attributes = File.GetAttributes(destination);
+                if ((attributes & FileAttributes.ReadOnly) != 0) File.SetAttributes(destination, attributes & ~FileAttributes.ReadOnly);
+            }
+            File.Copy(source, destination, true);
+            return;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            try
+            {
+                // A previous failed migration can leave files whose DACL refuses writes.
+                // Grant a temporary write ACE; CopyPreserving re-applies the source DACL afterwards.
+                GrantTemporaryWriteAccess(destination);
+                File.Copy(source, destination, true);
+                return;
+            }
+            catch (Exception retry)
+            {
+                throw new IOException($"Cannot copy '{source}' to '{destination}': {ex.Message}. A previous failed migration may have left read-only or restricted files in the destination; close applications using the destination and retry. Retry failed: {retry.Message}", retry);
+            }
+        }
+    }
+
+    private static void GrantTemporaryWriteAccess(string path)
+    {
+        var info = new FileInfo(path);
+        var security = FileSystemAclExtensions.GetAccessControl(info, AccessControlSections.Access);
+        security.SetAccessRuleProtection(true, false);
+        security.AddAccessRule(new FileSystemAccessRule(System.Security.Principal.WindowsIdentity.GetCurrent().User!, FileSystemRights.FullControl, AccessControlType.Allow));
+        FileSystemAclExtensions.SetAccessControl(info, security);
+    }
+
     private static void CopyFileMetadata(string source, string destination)
     {
         var sourceInfo = new FileInfo(source);
@@ -231,39 +278,44 @@ public sealed class WindowsTreeService : ITreeService
     // A cross-volume destination inherits a different DACL from its new parent. Writing
     // only the source DACL onto an unprotected object leaves the inherited ACEs in place,
     // so the copied tree silently receives the destination volume's permissions. Protect
-    // the DACL and re-create the source's effective rules (including inherited ones) as
-    // explicit ACEs to preserve the source's effective permissions.
+    // the DACL and copy the source's effective ACEs onto the destination.
     private static void CopyEffectiveAcl(FileSystemInfo source, FileSystemInfo destination)
     {
-        if (source is DirectoryInfo sourceDirectory && destination is DirectoryInfo destinationDirectory)
-        {
-            var sourceSecurity = FileSystemAclExtensions.GetAccessControl(sourceDirectory, AccessControlSections.Access);
-            var destinationSecurity = FileSystemAclExtensions.GetAccessControl(destinationDirectory, AccessControlSections.Access);
-            RewriteAcl(sourceSecurity, destinationSecurity);
-            FileSystemAclExtensions.SetAccessControl(destinationDirectory, destinationSecurity);
-            return;
-        }
-        var sourceFile = (FileInfo)source;
-        var destinationFile = (FileInfo)destination;
-        var sourceFileSecurity = FileSystemAclExtensions.GetAccessControl(sourceFile, AccessControlSections.Access);
-        var destinationFileSecurity = FileSystemAclExtensions.GetAccessControl(destinationFile, AccessControlSections.Access);
-        RewriteAcl(sourceFileSecurity, destinationFileSecurity);
-        FileSystemAclExtensions.SetAccessControl(destinationFile, destinationFileSecurity);
+        var sddl = ProtectedAclSddl(source);
+        // Managed FileSystemSecurity rebuilds ACEs through FileSystemAccessRule: it
+        // rejects GENERIC_* masks and silently rewrites or merges other raw masks.
+        // Write the self-relative descriptor directly with SetFileSecurity instead;
+        // PROTECTED_DACL_SECURITY_INFORMATION also stops Windows from recomputing an
+        // auto-inherited DACL from the destination parent.
+        var descriptor = new RawSecurityDescriptor(sddl);
+        var binary = new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(binary, 0);
+        if (!SetFileSecurity(destination.FullName, DaclSecurityInformation | ProtectedDaclSecurityInformation, binary))
+            throw new IOException($"Cannot apply the source DACL to '{destination.FullName}': {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
     }
 
-    private static void RewriteAcl(FileSystemSecurity sourceSecurity, FileSystemSecurity destinationSecurity)
+    // Copy the effective DACL at the ACE level. Rebuilding rules through
+    // FileSystemAccessRule rejects access masks that contain GENERIC_* bits
+    // (0xE0010000 becomes -536805376 as FileSystemRights), which is common in
+    // application-owned directories. SDDL/RawSecurityDescriptor keeps every 32-bit
+    // mask, ACE type, and inheritance flag; only Inherited is cleared because the
+    // destination DACL is protected rather than inherited from its new parent.
+    private static string ProtectedAclSddl(FileSystemInfo source)
     {
-        var effectiveRules = sourceSecurity.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier))
-            .OfType<FileSystemAccessRule>()
-            .Select(x => new FileSystemAccessRule(
-                (System.Security.Principal.SecurityIdentifier)x.IdentityReference,
-                x.FileSystemRights, x.InheritanceFlags, x.PropagationFlags, x.AccessControlType))
-            .ToList();
-        destinationSecurity.SetAccessRuleProtection(true, false);
-        foreach (var rule in destinationSecurity.GetAccessRules(true, false, typeof(System.Security.Principal.SecurityIdentifier))
-                     .OfType<FileSystemAccessRule>().ToList())
-            destinationSecurity.RemoveAccessRuleSpecific(rule);
-        foreach (var rule in effectiveRules) destinationSecurity.AddAccessRule(rule);
+        FileSystemSecurity sourceSecurity = source is DirectoryInfo sourceDirectory
+            ? FileSystemAclExtensions.GetAccessControl(sourceDirectory, AccessControlSections.Access)
+            : FileSystemAclExtensions.GetAccessControl((FileInfo)source, AccessControlSections.Access);
+        var descriptor = new RawSecurityDescriptor(sourceSecurity.GetSecurityDescriptorSddlForm(AccessControlSections.Access));
+        if (descriptor.DiscretionaryAcl is not null)
+            foreach (GenericAce ace in descriptor.DiscretionaryAcl)
+                ace.AceFlags &= ~AceFlags.Inherited;
+        // ControlFlags is read-only on a parsed descriptor, so normalize the SDDL
+        // prefix to D:P (DACL present + protected, no auto-inheritance).
+        var sddl = descriptor.GetSddlForm(AccessControlSections.Access);
+        var aclStart = sddl.IndexOf('(');
+        if (aclStart >= 0 && sddl.StartsWith("D:", StringComparison.Ordinal))
+            sddl = "D:P" + sddl[aclStart..];
+        return sddl;
     }
 
     private static void CopyDirectoryTimesAndAttributes(string source, string destination)
@@ -289,23 +341,46 @@ public sealed class WindowsTreeService : ITreeService
         catch (ArgumentException) { return false; }
     }
 
-    // An inherited ACE and the equivalent explicit ACE grant the same effective rights.
-    // A cross-volume copy necessarily changes the inheritance origin, so compare the
-    // effective DACL while ignoring only the Inherited flag. This also accepts older
-    // journals that stored a complete security descriptor instead of a DACL-only SDDL.
+    // An inherited ACE and the equivalent explicit ACE grant the same effective rights,
+    // and a cross-volume copy necessarily changes the inheritance origin. Windows also
+    // maps GENERIC_* bits to file-specific rights and merges duplicate SID ACEs when a
+    // DACL is applied, so compare effective masks per (ACE type, flags, SID) instead of
+    // raw ACE bytes. This also accepts legacy journals with full security descriptors.
     private static List<string> NormalizedAceSet(string sddl)
     {
-        var result = new List<string>();
+        var effective = new Dictionary<string, uint>(StringComparer.Ordinal);
+        var opaque = new List<string>();
         var acl = new RawSecurityDescriptor(sddl).DiscretionaryAcl;
-        if (acl is null) return result;
+        if (acl is null) return opaque;
         foreach (GenericAce ace in acl)
         {
             var bytes = new byte[ace.BinaryLength];
             ace.GetBinaryForm(bytes, 0);
-            bytes[1] = (byte)(bytes[1] & ~(byte)AceFlags.Inherited);
-            result.Add(Convert.ToHexString(bytes));
+            var flags = (byte)(bytes[1] & ~(byte)AceFlags.Inherited);
+            if (ace is CommonAce common && bytes.Length >= 8 && bytes[0] <= 1)
+            {
+                var key = $"M:{bytes[0]}|{flags}|{common.SecurityIdentifier.Value}";
+                var rights = MapGenericFileRights((uint)common.AccessMask);
+                effective[key] = effective.TryGetValue(key, out var current) ? current | rights : rights;
+            }
+            else
+            {
+                bytes[1] = flags;
+                opaque.Add("O:" + Convert.ToHexString(bytes));
+            }
         }
+        var result = effective.Select(x => $"{x.Key}|{x.Value:X8}").Concat(opaque).ToList();
         result.Sort(StringComparer.Ordinal);
+        return result;
+    }
+
+    private static uint MapGenericFileRights(uint mask)
+    {
+        var result = mask & 0x0FFFFFFFu;
+        if ((mask & 0x80000000u) != 0) result |= 0x00120089u;
+        if ((mask & 0x40000000u) != 0) result |= 0x00120116u;
+        if ((mask & 0x20000000u) != 0) result |= 0x001200A0u;
+        if ((mask & 0x10000000u) != 0) result |= 0x001F01FFu;
         return result;
     }
 
