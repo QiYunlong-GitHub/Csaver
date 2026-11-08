@@ -57,3 +57,30 @@ fsutil reparsepoint query "$env:USERPROFILE\.workbuddy"
 - The current build protects the destination DACL and rebuilds the source's effective access rules (including inherited ones) as explicit ACEs. Verification compares the effective DACL and ignores only the inheritance origin; the permission set itself must still match exactly.
 
 **Required step before retrying**: a verification failure leaves a `RecoveryRequired` journal under `<DestRoot>\.csaver-journal`. Preflight refuses a preview or migration while a matching incomplete journal exists. Select **Recover Incomplete Transaction** with the task checked first, then rerun Preview Migration and Run Migration. The previous copy in the destination is overwritten file by file, while destination-only data is retained. Do not manually delete the destination or the journal before recovery.
+
+## Troubleshooting: repeated failures on another PC (Trae CN / `.trae-cn`)
+
+**Symptoms**: `The value '-536805376' is not valid for this usage of the type FileSystemRights`, `Access to the path 'D:\...\git\objects\...' is denied` on a retry, `Access to the path 'distro-support.json' is denied` during cutover, then `RECOVERY_REFUSED` / `REPAIR_NEEDS_REVIEW`.
+
+**Root causes**:
+
+1. Application-owned DACLs can contain raw `GENERIC_*` masks (for example `0xE0010000`, which reads back as `-536805376` when cast to `FileSystemRights`). Older builds rebuilt every ACE through `FileSystemAccessRule`, which rejects that mask and aborts the copy. The current build copies the DACL as a raw security descriptor with a protected (`D:P`) DACL; verification compares effective rights, maps `GENERIC_*` bits to file rights, and merges duplicate ACEs for the same trustee.
+2. A failed run leaves a half-copied destination whose files are read-only or carry a restrictive DACL. A plain `File.Copy(..., true)` then fails with `Access ... is denied`. The current build clears `ReadOnly`, grants the current user a temporary write ACE for the retry, and re-applies the source DACL afterwards.
+3. The application still holds handles on source files, so `Directory.Move` (staging) and `Directory.Delete` (staging cleanup) fail with only a short file name. The current build checks that source files can be opened exclusively **before** copying, clears read-only attributes before removing staging, and reports full paths plus a "close applications" hint.
+4. Once copy or cutover has written `SourceSnapshot` / `DestinationSnapshot` into the journal, recovery is intentionally fail-closed. `RECOVERY_REFUSED` and `REPAIR_NEEDS_REVIEW` must not be bypassed by deleting the journal.
+
+**Immediate unblock on that PC**:
+
+1. Fully exit the application, including its tray icon and background helpers; reboot if handles persist.
+2. Record the real state before touching anything:
+
+   ```powershell
+   Get-Item -LiteralPath "$env:APPDATA\Trae CN" -Force | Select-Object FullName, Attributes, LinkType, Target
+   Get-Item -LiteralPath "D:\<DestRoot>\<task>" -Force | Select-Object FullName, Attributes, LinkType, Target
+   Get-ChildItem -LiteralPath "D:\<DestRoot>\.csaver-journal" -Force
+   ```
+
+3. Use the new release ZIP: replace `Csaver.exe` in the existing folder, keeping `config/` and `data/` intact, or extract to a fresh folder and copy `config/` across. Never delete history files or journals while "cleaning up".
+4. Select only the failed task and run **Recover Incomplete Transaction**. For a pre-cutover journal this clears the transaction; rerun **Preview Migration** and **Run Migration**. Read-only or restricted leftovers are now overwritten automatically.
+5. If recovery reports `RECOVERY_REFUSED` (the journal contains snapshot evidence of copy/cutover progress), **stop**. Keep the source, destination, staging directory, and journal intact; do not force-kill the elevated worker. Collect `logs/worker-<OperationId>.log` and the journal, compare both trees, and resolve the cutover manually with the data verified. Automatic recovery is deliberately not widened to this state.
+6. If a source file is locked, the new error contains its full path. Close the owning application and retry. Csaver now fails before cutover, so a healthy source no longer produces an unrecoverable journal.

@@ -171,6 +171,8 @@ CSAVER_TIMESTAMP_URL
 - **“请至少勾选一项”与“所选任务均已被禁用”**：前者表示没有任何任务被勾选；后者表示勾选的任务全部为 `"Disabled": true`，被 GUI 过滤。请在「配置」中启用对应任务、保存并刷新后再执行；「解释配置」仍会显示禁用任务。
 - **提示 `Copy verification failed: Metadata/content differs (acl): ...`**：复制已完成，但有效 ACL 与源不一致，通常是跨盘迁移时目标继承了新父目录的权限，而不是源目录的权限。校验是 fail-closed：不会删源、不会创建联接。当前版本会保护目标 DACL，并把源的有效访问规则重建为显式 ACE，使有效权限一致；括号中的字段会标明确切差异（`acl`、`lastWriteTime`、`attributes`、`content`）。验证失败会在 `<DestRoot>\.csaver-journal` 留下 `RecoveryRequired` journal，请先对该任务执行「恢复未完成事务」，再重新预览与迁移。
 
+- **另一台电脑反复失败（`FileSystemRights -536805376`、`Access ... is denied`、`RECOVERY_REFUSED`）**：应用自建目录的 DACL 可能含旧版本无法重建的原始 `GENERIC_*` 掩码；失败后还会留下只读／受限残留文件，或源文件仍被应用占用。当前版本以受保护的原始安全描述符复制 DACL、自动覆盖受限残留、在被占用时提前于切换阶段失败，并给出完整路径。根因与逐步脱困步骤见 `docs/user-guide.zh-CN.md`；不要通过删除 journal 绕过 `RECOVERY_REFUSED`。
+
 ## 许可证
 
 本项目使用 MIT License，详见 `LICENSE`。

@@ -57,3 +57,30 @@ fsutil reparsepoint query "$env:USERPROFILE\.workbuddy"
 - 当前版本会保护目标的 DACL，并把源的有效访问规则（含继承规则）重建为显式 ACE；校验按有效 DACL 比较，只忽略“继承 / 显式”这一来源差异，权限集合本身仍必须完全一致。
 
 **重跑前的必要步骤**：验证失败会留下状态为 `RecoveryRequired` 的 journal（位于 `<DestRoot>\.csaver-journal`）。预检会拒绝带匹配未完成 journal 的预览或迁移。请先在「命令」中选择 **恢复未完成事务** 并勾选该任务，成功后重新执行「预览迁移」，再执行「运行迁移」。目标目录中上次复制的数据会被同名文件覆盖，目标独有数据仍会保留。不要在恢复前手动删除目标目录或 journal。
+
+## 故障排查：另一台电脑反复失败（Trae CN / `.trae-cn`）
+
+**症状**：`The value '-536805376' is not valid for this usage of the type FileSystemRights`；重跑时 `Access to the path 'D:\...\git\objects\...' is denied`；切换阶段 `Access to the path 'distro-support.json' is denied`；随后出现 `RECOVERY_REFUSED` / `REPAIR_NEEDS_REVIEW`。
+
+**根因**：
+
+1. 应用自建目录的 DACL 可能包含原始 `GENERIC_*` 访问掩码（例如 `0xE0010000`，转成 `FileSystemRights` 就是 `-536805376`）。旧版本通过 `FileSystemAccessRule` 逐条重建 ACE，遇到该掩码会直接抛异常并中断复制。当前版本以原始安全描述符写入受保护（`D:P`）的 DACL；校验改为比较有效权限，会把 `GENERIC_*` 位映射为文件权限，并合并同一受托人的重复 ACE。
+2. 上一次失败在目标侧留下半复制数据，其中部分文件为只读或带受限 DACL，普通 `File.Copy(..., true)` 覆盖时报 `Access ... is denied`。当前版本会先清除 `ReadOnly`，必要时为当前用户临时授予写权限再重试，随后重新应用源 DACL。
+3. 应用仍占用源文件句柄，导致暂存 `Directory.Move` 和暂存清理 `Directory.Delete` 失败，且旧异常只给出短文件名。当前版本在复制**之前**就检测源文件是否可独占打开，删除暂存前清除只读属性，并在异常中给出完整路径与「关闭应用」提示。
+4. 一旦复制或切换已把 `SourceSnapshot` / `DestinationSnapshot` 写入 journal，恢复逻辑按 fail-closed 拒绝。`RECOVERY_REFUSED` 与 `REPAIR_NEEDS_REVIEW` 不能靠删除 journal 绕过。
+
+**该电脑上的即时脱困步骤**：
+
+1. 完全退出相关应用（含托盘图标与后台辅助进程）；句柄无法释放时重启电脑。
+2. 动手前先记录真实状态：
+
+   ```powershell
+   Get-Item -LiteralPath "$env:APPDATA\Trae CN" -Force | Select-Object FullName, Attributes, LinkType, Target
+   Get-Item -LiteralPath "D:\<DestRoot>\<task>" -Force | Select-Object FullName, Attributes, LinkType, Target
+   Get-ChildItem -LiteralPath "D:\<DestRoot>\.csaver-journal" -Force
+   ```
+
+3. 使用新发布包：把新 `Csaver.exe` 覆盖到原目录（保留 `config/` 与 `data/`），或解压到全新目录后把 `config/` 复制过来。不要以「清理」为名删除历史记录或 journal。
+4. 只勾选失败的任务，执行 **恢复未完成事务**。对切换前的 journal，恢复成功后重新「预览迁移」再「运行迁移」；只读或受限残留文件现在会自动覆盖。
+5. 若恢复返回 `RECOVERY_REFUSED`（journal 已含复制/切换阶段的快照证据），**立即停止**。保持源、目标、暂存目录和 journal 原样，不要强制结束提权 worker；保留 `logs/worker-<OperationId>.log` 与 journal，先比对两棵树，确认数据后再人工处置切换。此状态刻意不提供自动恢复。
+6. 若源文件被占用，新异常会给出完整路径；关闭对应程序后重试。现在会在切换前失败，健康的源目录不会再产生无法自动恢复的 journal。
