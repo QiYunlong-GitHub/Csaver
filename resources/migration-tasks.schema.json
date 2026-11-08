@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csaver.local/schemas/migration-tasks.schema.json",
+  "title": "Csaver migration tasks",
+  "oneOf": [
+    { "type": "array", "items": { "$ref": "#/$defs/task" } },
+    {
+      "type": "object",
+      "required": ["Tasks"],
+      "properties": {
+        "DestRoot": { "type": "string" },
+        "Tasks": { "type": "array", "items": { "$ref": "#/$defs/task" } }
+      },
+      "additionalProperties": true
+    }
+  ],
+  "$defs": {
+    "task": {
+      "type": "object",
+      "required": ["Group"],
+      "properties": {
+        "TaskId": { "type": "string", "minLength": 1 },
+        "Group": { "type": "string", "minLength": 1 },
+        "Root": { "type": "string" },
+        "Rel": { "type": "string" },
+        "Source": { "type": "string" },
+        "Dest": { "type": "string" },
+        "Guard": { "type": "string" },
+        "Disabled": { "type": "boolean" },
+        "TrustedReparsePoints": {
+          "type": "array",
+          "description": "Optional, default-deny list of in-tree relative paths (backslash-separated, no drive, no '..', no wildcards). Applies to read-only inspection only; copy, snapshot, deletion, and cutover remain fail-closed.",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "anyOf": [
+        { "required": ["Source"] },
+        { "required": ["Root", "Rel"] }
+      ],
+      "additionalProperties": true
+    }
+  }
+}
