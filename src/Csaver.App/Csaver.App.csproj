@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Csaver</AssemblyName>
+    <RootNamespace>Csaver.App</RootNamespace>
+    <ApplicationIcon>..\..\resources\Csaver.ico</ApplicationIcon>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>false</PublishTrimmed>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Csaver.Core\Csaver.Core.csproj" />
+    <ProjectReference Include="..\Csaver.Application\Csaver.Application.csproj" />
+    <ProjectReference Include="..\Csaver.Windows\Csaver.Windows.csproj" />
+    <EmbeddedResource Include="..\..\resources\migration-tasks.json" Link="Resources\migration-tasks.json" LogicalName="Csaver.DefaultMigrationTasks.json" />
+  </ItemGroup>
+</Project>
