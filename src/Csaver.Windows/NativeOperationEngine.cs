@@ -297,6 +297,30 @@ public sealed class NativeOperationEngine : IOperationEngine
         }
     }
 
+    // Snapshot verification stays strictly fail-closed: no difference is ignored and no
+    // file is recopied. This only makes the failure actionable, including the correct
+    // command to run next (recovery, not repair) and whether recovery is still possible.
+    private static string BuildInstabilityMessage(ResolvedMigrationTask task, SnapshotComparison comparison, string prefix, bool sourceStillChanging, bool snapshotEvidence)
+    {
+        var details = string.Join("; ", comparison.Details.Take(5));
+        var remaining = comparison.Details.Count > 5 ? $" (+{comparison.Details.Count - 5} more differences)" : string.Empty;
+        var changedEntries = string.Join(", ", comparison.Details
+            .Select(x => x.Contains(':') ? x[(x.LastIndexOf(':') + 1)..].Trim() : x.Trim())
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(5));
+        var guardHint = string.IsNullOrWhiteSpace(task.Guard)
+            ? "Close every application writing to the source directory, including tray and background helpers."
+            : $"Close the application matching Guard '{task.Guard}', including its tray and background helpers.";
+        var cause = sourceStillChanging
+            ? "The source directory was rewritten while Csaver was copying it; a second source snapshot changed again."
+            : "The source directory was rewritten while Csaver was copying it (or its metadata did not survive the copy); the source was not stable.";
+        var recovery = snapshotEvidence
+            ? "This journal already contains snapshot evidence, so automatic recovery will be refused. Keep the source, destination, and journal intact and follow the user guide to resolve the transaction manually."
+            : "This transaction has no snapshot evidence yet. Run Recover Incomplete Transaction, then Preview Migration and Run Migration again. Do not use Repair for a copy verification failure; Repair is for a broken Junction.";
+        return $"{prefix}: {details}{remaining} | MismatchCount={comparison.MismatchCount}; MissingCount={comparison.MissingCount}; changedEntries={changedEntries}. {cause} {guardHint} {recovery} The source was left intact and no Junction was created.";
+    }
+
     private static void EnsureSourceMovable(string source, CancellationToken cancellationToken)
     {
         var pending = new Stack<string>();
@@ -400,13 +424,28 @@ public sealed class NativeOperationEngine : IOperationEngine
                 var sourceSnapshot = trees.CaptureSnapshot(task.Source, cancellationToken);
                 var destinationSnapshot = trees.CaptureSnapshot(task.Destination, cancellationToken);
                 var verification = trees.Compare(sourceSnapshot, destinationSnapshot, allowDestinationOnly: true);
-                if (!verification.Success) throw new IOException("Copy verification failed: " + string.Join("; ", verification.Details.Take(5)));
+                if (!verification.Success)
+                {
+                    // A mismatch here is usually the guarded application rewriting its own data
+                    // mid-copy. Re-snapshot the source to confirm, then fail closed with an
+                    // actionable message. This stays before the journal's snapshot assignments,
+                    // so the transaction remains eligible for Recover Incomplete Transaction.
+                    var stillChanging = false;
+                    try
+                    {
+                        var rescan = trees.CaptureSnapshot(task.Source, cancellationToken);
+                        stillChanging = !trees.Compare(sourceSnapshot, rescan, allowDestinationOnly: false).Success;
+                    }
+                    catch { /* diagnostic only; never mask the verification failure */ }
+                    throw new IOException(BuildInstabilityMessage(task, verification, "Copy verification failed", stillChanging, snapshotEvidence: false));
+                }
                 journal.SourceSnapshot = sourceSnapshot;
                 journal.DestinationSnapshot = destinationSnapshot;
                 journals.Transition(journalPath, journal, "Verified");
                 var fresh = trees.CaptureSnapshot(task.Source, cancellationToken);
                 var stable = trees.Compare(sourceSnapshot, fresh, allowDestinationOnly: false);
-                if (!stable.Success) throw new IOException("Source changed during migration.");
+                if (!stable.Success)
+                    throw new IOException(BuildInstabilityMessage(task, stable, "Source changed during migration", sourceStillChanging: true, snapshotEvidence: true));
                 journals.Transition(journalPath, journal, "SourceVerified");
 
                 cancellationToken.ThrowIfCancellationRequested();
@@ -490,13 +529,20 @@ public sealed class NativeOperationEngine : IOperationEngine
                     journals.Transition(journalPath, journal, "Verified");
                     progress?.Report(Progress(request, task, "Cutover", "Entering non-cancellable repair cutover.", true));
                     if (sourceInfo.IsJunction) junctions.Delete(task.Source);
-                    else { Directory.CreateDirectory(Path.GetDirectoryName(stagePayload)!); Directory.Move(task.Source, stagePayload); journals.Transition(journalPath, journal, "SourceStaged"); }
-                    if (sourceInfo.IsJunction) { journal.State = "SourceStaged"; AtomicFiles.WriteJson(journalPath, journal); }
+                    else { Directory.CreateDirectory(Path.GetDirectoryName(stagePayload)!); Directory.Move(task.Source, stagePayload); }
+                    // Both source shapes share the same auditable state chain; writing journal.State
+                    // directly here used to bypass JournalStore and skip the JunctionCreated step.
+                    journals.Transition(journalPath, journal, "SourceStaged");
                     junctions.Create(task.Source, task.Destination);
+                    journals.Transition(journalPath, journal, "JunctionCreated");
                     var finalLink = junctions.Inspect(task.Source);
                     if (!finalLink.IsJunction || !PathsEqual(finalLink.Target, task.Destination)) throw new IOException("Final repair Junction validation failed.");
                     journals.Transition(journalPath, journal, "LinkValidated");
-                    if (Directory.Exists(stagePayload)) Directory.Delete(stagePayload, true);
+                    if (Directory.Exists(stagePayload))
+                    {
+                        ClearReadOnlyAttributes(stagePayload);
+                        Directory.Delete(stagePayload, true);
+                    }
                     journals.Transition(journalPath, journal, "Committed", retryable: false);
                     row.Status = "REPAIR_MERGED"; row.TransactionState = "Committed"; row.Retryable = false;
                     row.FileCount = journal.DestinationSnapshot.FileCount; row.SizeBytes = journal.DestinationSnapshot.Bytes;
