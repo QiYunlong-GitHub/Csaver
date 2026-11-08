@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Csaver.App/Csaver.App.csproj" />
+    <Project Path="src/Csaver.Application/Csaver.Application.csproj" />
+    <Project Path="src/Csaver.Core/Csaver.Core.csproj" />
+    <Project Path="src/Csaver.Windows/Csaver.Windows.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Csaver.Tests/Csaver.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/Csaver.Packaging/Csaver.Packaging.csproj" />
+  </Folder>
+</Solution>
