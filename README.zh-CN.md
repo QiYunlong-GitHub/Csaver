@@ -173,6 +173,9 @@ CSAVER_TIMESTAMP_URL
 
 - **另一台电脑反复失败（`FileSystemRights -536805376`、`Access ... is denied`、`RECOVERY_REFUSED`）**：应用自建目录的 DACL 可能含旧版本无法重建的原始 `GENERIC_*` 掩码；失败后还会留下只读／受限残留文件，或源文件仍被应用占用。当前版本以受保护的原始安全描述符复制 DACL、自动覆盖受限残留、在被占用时提前于切换阶段失败，并给出完整路径。根因与逐步脱困步骤见 `docs/user-guide.zh-CN.md`；不要通过删除 journal 绕过 `RECOVERY_REFUSED`。
 
+- **提示 `Copy verification failed: Metadata/content differs (lastWriteTime)` / `(length,content)`**：受 Guard 保护的应用（例如豆包在 `.skills` 下的 xlsx/doc 模板）在 Csaver 复制期间重写了自己的文件。校验仍严格 fail-closed：不忽略任何差异、不自动重拷；当前版本会在错误信息里列出变化条目、差异计数和需要关闭的 `Guard` 进程。源目录保持原样、未创建联接、journal 也没有快照证据。请先完全退出该应用，执行 **恢复未完成事务**，再重新「预览迁移」「运行迁移」。**不要用「运行修复」处理复制校验失败**：修复只适用于应用更新或重装把联接替换成真实目录的场景。详见 `docs/user-guide.zh-CN.md`。
+- **提示 `REPAIR_NEEDS_REVIEW: Invalid journal transition: SourceStaged -> LinkValidated`**：旧版本在修复切换阶段漏了 `JunctionCreated` 这一步，导致每次修复都在暂存后失败，并反复列出同样的冲突文件。当前版本按 `Merging → Verified → SourceStaged → JunctionCreated → LinkValidated → Committed` 完整链路提交；此前失败留下的冲突归档按「不删除数据」原则保留。若修复仍返回 `REPAIR_NEEDS_REVIEW`，请按详情中的具体原因处置，不要删除 journal、源、目标或暂存目录。
+
 ## 许可证
 
 本项目使用 MIT License，详见 `LICENSE`。

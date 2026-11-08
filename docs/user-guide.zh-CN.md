@@ -67,7 +67,7 @@ fsutil reparsepoint query "$env:USERPROFILE\.workbuddy"
 1. 应用自建目录的 DACL 可能包含原始 `GENERIC_*` 访问掩码（例如 `0xE0010000`，转成 `FileSystemRights` 就是 `-536805376`）。旧版本通过 `FileSystemAccessRule` 逐条重建 ACE，遇到该掩码会直接抛异常并中断复制。当前版本以原始安全描述符写入受保护（`D:P`）的 DACL；校验改为比较有效权限，会把 `GENERIC_*` 位映射为文件权限，并合并同一受托人的重复 ACE。
 2. 上一次失败在目标侧留下半复制数据，其中部分文件为只读或带受限 DACL，普通 `File.Copy(..., true)` 覆盖时报 `Access ... is denied`。当前版本会先清除 `ReadOnly`，必要时为当前用户临时授予写权限再重试，随后重新应用源 DACL。
 3. 应用仍占用源文件句柄，导致暂存 `Directory.Move` 和暂存清理 `Directory.Delete` 失败，且旧异常只给出短文件名。当前版本在复制**之前**就检测源文件是否可独占打开，删除暂存前清除只读属性，并在异常中给出完整路径与「关闭应用」提示。
-4. 一旦复制或切换已把 `SourceSnapshot` / `DestinationSnapshot` 写入 journal，恢复逻辑按 fail-closed 拒绝。`RECOVERY_REFUSED` 与 `REPAIR_NEEDS_REVIEW` 不能靠删除 journal 绕过。
+4. 一旦复制或切换已把 `SourceSnapshot` / `DestinationSnapshot` 写入 journal，恢复逻辑按 fail-closed 拒绝，`RECOVERY_REFUSED` 不能靠删除 journal 绕过。`REPAIR_NEEDS_REVIEW` 的具体原因总是写在详情里——旧版本还可能是下文所述的修复切换状态机缺陷；无论哪种情况都不要删除 journal、源、目标或暂存目录来绕过。
 
 **该电脑上的即时脱困步骤**：
 
@@ -84,3 +84,29 @@ fsutil reparsepoint query "$env:USERPROFILE\.workbuddy"
 4. 只勾选失败的任务，执行 **恢复未完成事务**。对切换前的 journal，恢复成功后重新「预览迁移」再「运行迁移」；只读或受限残留文件现在会自动覆盖。
 5. 若恢复返回 `RECOVERY_REFUSED`（journal 已含复制/切换阶段的快照证据），**立即停止**。保持源、目标、暂存目录和 journal 原样，不要强制结束提权 worker；保留 `logs/worker-<OperationId>.log` 与 journal，先比对两棵树，确认数据后再人工处置切换。此状态刻意不提供自动恢复。
 6. 若源文件被占用，新异常会给出完整路径；关闭对应程序后重试。现在会在切换前失败，健康的源目录不会再产生无法自动恢复的 journal。
+
+## 故障排查：豆包复制校验失败与修复切换报错
+
+**症状**：`FAIL_TRANSACTION ... Copy verification failed: Metadata/content differs (lastWriteTime): ...\assets\comps; Metadata/content differs (length,content): ...\comps-model-template.xlsx`；随后连续两次「运行修复」都返回 `REPAIR_NEEDS_REVIEW ... Invalid journal transition: SourceStaged -> LinkValidated`，而修复预览每次都列出同样的 10 个冲突文件。
+
+**根因**：
+
+1. 豆包进程在 `CopyPreserving` 执行期间重写了自己的 skills 模板资产（`.xlsx` / `.doc`）。Csaver 在复制**之后**才对源取快照，逐项与目标比较长度、时间、属性、ACL 和内容 SHA256；任一差异都会在删源之前中止。这是刻意的 fail-closed 行为，当前版本**不自动重拷**变化文件、也**不忽略**任何差异，只是把失败变得可操作：给出变化条目、差异计数、需要关闭的 `Guard` 值，以及正确的下一步命令。
+2. 复制校验失败的异常在写 `SourceSnapshot` / `DestinationSnapshot` **之前**抛出，因此该 journal 没有快照证据，仍然可以执行 **恢复未完成事务**。改用「运行修复」是命令选错：修复面向的是应用更新或重装把联接替换成真实目录的断链场景，而不是源目录不稳定。
+3. 旧版本的修复切换存在缺陷：从 `SourceStaged` 直接跳到 `LinkValidated`，漏掉了状态机要求的 `JunctionCreated`。异常发生在「不可取消」阶段，于是每次都把源移回、删掉刚建的联接，而 merge 已经把文件写入目标、把冲突归档到 `_repair_conflicts` / `_repair_backup`。这些归档按「不删除数据」原则保留，所以预览会反复列出同样的冲突。当前版本按 `Merging → Verified → SourceStaged → JunctionCreated → LinkValidated → Committed` 完整链路正常提交。
+
+**该电脑上的处置步骤**：
+
+1. 完全退出豆包（含托盘图标与后台辅助进程）；若仍在写文件则重启。被占用的应用数据目录应当关闭程序后重跑，而不是强行通过。
+2. 用新发布包替换 `Csaver.exe`，保留 `config/` 与 `data/`。不要以「清理」为名删除历史记录、journal、`_repair_conflicts` 或 `_repair_backup`。
+3. 重试前先记录真实状态：
+
+   ```powershell
+   Get-Item -LiteralPath "$env:LOCALAPPDATA\Doubao" -Force | Select-Object FullName, Attributes, LinkType, Target
+   Get-Item -LiteralPath "D:\AppDataMoved\Local\Doubao" -Force | Select-Object FullName, Attributes, LinkType, Target
+   Get-ChildItem -LiteralPath "D:\AppDataMoved\.csaver-journal" -Force
+   ```
+
+4. 只勾选 `doubao-local`，执行 **恢复未完成事务**，再执行「预览迁移」与「运行迁移」。只有当源确实是断链联接、或应用更新后留下的真实目录时，才使用「运行修复」。
+5. 若再次失败，新错误会列出变化条目和 `Guard` 值（`doubao`）；关闭该应用后重试。Csaver 不会替你重拷变化文件，也不会为了让校验通过而放宽检查。
+6. 若 journal 已含快照证据，自动恢复会被拒绝。请保持两棵树和 journal 原样，按上文的恢复章节人工处置。
