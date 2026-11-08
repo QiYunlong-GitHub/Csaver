@@ -243,6 +243,62 @@ public sealed class JournalAndFilesystemTests
     }
 
     [TestMethod]
+    public void CopyPreservesAclsContainingGenericAccessMaskBits()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(Path.Combine(folder.Path, "generic-source")).FullName;
+        var destination = Path.Combine(folder.Path, "generic-destination");
+        File.WriteAllText(Path.Combine(source, "a.txt"), "payload");
+        var sid = WindowsIdentity.GetCurrent().User!.Value;
+        // 0xE0010000 (GENERIC_READ|GENERIC_WRITE|GENERIC_EXECUTE|DELETE) becomes
+        // -536805376 when read as FileSystemRights; the old FileSystemAccessRule
+        // reconstruction threw ArgumentException on this exact mask.
+        var genericSddl = $"D:(A;OICI;GA;;;SY)(A;OICI;0xE0010000;;;BA)(A;OICI;FA;;;{sid})";
+        try
+        {
+            var info = new DirectoryInfo(source);
+            var security = FileSystemAclExtensions.GetAccessControl(info, AccessControlSections.Access);
+            security.SetSecurityDescriptorSddlForm(genericSddl, AccessControlSections.Access);
+            FileSystemAclExtensions.SetAccessControl(info, security);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or PrivilegeNotHeldException or ArgumentException)
+        {
+            Assert.Inconclusive("This environment cannot apply generic-rights ACLs: " + ex.Message);
+            return;
+        }
+
+        var trees = new WindowsTreeService();
+        trees.CopyPreserving(source, destination);
+
+        var comparison = trees.Compare(trees.CaptureSnapshot(source), trees.CaptureSnapshot(destination), true);
+        var sourceAcl = AclOf(Path.Combine(source, "a.txt"));
+        var destinationAcl = AclOf(Path.Combine(destination, "a.txt"));
+        Assert.IsTrue(comparison.Success, $"{string.Join("; ", comparison.Details)} SOURCE_ACL={sourceAcl} DESTINATION_ACL={destinationAcl}");
+        Assert.AreEqual(0, comparison.MismatchCount);
+    }
+
+    private static string AclOf(string path) =>
+        FileSystemAclExtensions.GetAccessControl(new FileInfo(path), AccessControlSections.Access)
+            .GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+
+    [TestMethod]
+    public void CopyOverwritesReadOnlyDestinationLeftoversFromAFailedMigration()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(Path.Combine(folder.Path, "retry-source")).FullName;
+        var destination = Directory.CreateDirectory(Path.Combine(folder.Path, "retry-destination")).FullName;
+        File.WriteAllText(Path.Combine(source, "a.txt"), "new-data");
+        var stale = Path.Combine(destination, "a.txt");
+        File.WriteAllText(stale, "stale-data");
+        File.SetAttributes(stale, FileAttributes.ReadOnly);
+
+        var trees = new WindowsTreeService();
+        trees.CopyPreserving(source, destination);
+
+        Assert.AreEqual("new-data", File.ReadAllText(stale));
+    }
+
+    [TestMethod]
     public void SnapshotVerificationDetectsSameSizeContentChanges()
     {
         using var folder = new TempFolder();
@@ -751,6 +807,30 @@ public sealed class MigrationTransactionTests
         StringAssert.Contains(result.Tasks.Single().Detail, "Destination scan");
         StringAssert.Contains(result.Tasks.Single().Detail, "Unsafe reparse point encountered");
         Assert.AreEqual(1, trees.DestinationScans);
+    }
+
+    [TestMethod]
+    public async Task LockedSourceFailsBeforeCutoverAndRemainsRecoverable()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "source")).FullName;
+        var destination = System.IO.Path.Combine(folder.Path, "destination");
+        var lockedFile = System.IO.Path.Combine(source, "locked.txt");
+        File.WriteAllText(lockedFile, "data");
+        using var exclusive = new FileStream(lockedFile, FileMode.Open, FileAccess.Read, FileShare.None);
+        var workspace = new PortableWorkspace(folder.Path);
+        workspace.Initialize(Configuration(source, destination));
+        var engine = new NativeOperationEngine(new FakeJunctionService(), new WindowsTreeService(), new ConfigurationService(), new TaskResolver(), new JournalStore());
+
+        var result = await engine.ExecuteAsync(Request(workspace));
+
+        Assert.IsFalse(result.Success, result.Message);
+        Assert.AreEqual("FAIL_TRANSACTION", result.Tasks.Single().Status);
+        StringAssert.Contains(result.Tasks.Single().Detail, "locked or unreadable");
+        var journalPath = Directory.GetFiles(System.IO.Path.Combine(folder.Path, ".csaver-journal"), "forward-*.json").Single();
+        var journalText = File.ReadAllText(journalPath);
+        Assert.IsFalse(journalText.Contains("\"SourceSnapshot\": {") || journalText.Contains("\"DestinationSnapshot\": {"),
+            "A pre-copy failure must not attach snapshot evidence that blocks recovery.");
     }
 
     private static string Configuration(string source, string destination) =>
