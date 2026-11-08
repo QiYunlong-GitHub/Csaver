@@ -1,0 +1,34 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.201
+      - name: Restore
+        run: dotnet restore Csaver.Gui.slnx
+      - name: Test
+        run: dotnet test Csaver.Gui.slnx -c Release --no-restore
+      - name: Publish single-file application
+        run: dotnet publish src\Csaver.App\Csaver.App.csproj -c Release -r win-x64 --self-contained true --no-restore -o artifacts\publish
+      - name: Package and validate release
+        run: dotnet run --project tools\Csaver.Packaging\Csaver.Packaging.csproj -c Release -- artifacts\publish artifacts\Csaver-win-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Csaver-win-x64
+          path: artifacts\Csaver-win-x64.zip
+          if-no-files-found: error
