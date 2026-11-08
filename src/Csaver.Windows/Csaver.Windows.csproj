@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Csaver.Windows</AssemblyName>
+    <RootNamespace>Csaver.Windows</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Csaver.Core\Csaver.Core.csproj" />
+    <ProjectReference Include="..\Csaver.Application\Csaver.Application.csproj" />
+    <PackageReference Include="System.IO.FileSystem.AccessControl" />
+  </ItemGroup>
+</Project>
