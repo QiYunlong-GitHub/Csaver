@@ -833,10 +833,91 @@ public sealed class MigrationTransactionTests
             "A pre-copy failure must not attach snapshot evidence that blocks recovery.");
     }
 
-    private static string Configuration(string source, string destination) =>
+    [TestMethod]
+    public async Task RepairCommitsThroughFullJournalStateChainFromADirectory()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "source")).FullName;
+        var destination = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "destination")).FullName;
+        File.WriteAllText(System.IO.Path.Combine(source, "a.txt"), "new-data");
+        File.WriteAllText(System.IO.Path.Combine(destination, "a.txt"), "old-data");
+        var workspace = new PortableWorkspace(folder.Path);
+        workspace.Initialize(Configuration(source, destination));
+        var junctions = new FakeJunctionService();
+        var engine = new NativeOperationEngine(junctions, new WindowsTreeService(), new ConfigurationService(), new TaskResolver(), new JournalStore());
+
+        var result = await engine.ExecuteAsync(Request(workspace, OperationKind.Repair));
+
+        Assert.IsTrue(result.Success, result.Message);
+        var row = result.Tasks.Single();
+        Assert.AreEqual("REPAIR_MERGED", row.Status, row.Detail);
+        Assert.AreEqual("Committed", new JournalStore().Load(row.JournalPath)!.State);
+        Assert.IsTrue(junctions.Inspect(source).IsJunction);
+    }
+
+    [TestMethod]
+    public async Task RepairCommitsFromAJunctionWithAWrongTarget()
+    {
+        using var folder = new TempFolder();
+        var source = System.IO.Path.Combine(folder.Path, "source");
+        var wrongTarget = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "wrong-target")).FullName;
+        var destination = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "destination")).FullName;
+        File.WriteAllText(System.IO.Path.Combine(wrongTarget, "a.txt"), "from-wrong-target");
+        var workspace = new PortableWorkspace(folder.Path);
+        workspace.Initialize(Configuration(source, destination));
+        var junctions = new FakeJunctionService();
+        junctions.Create(source, wrongTarget);
+        var engine = new NativeOperationEngine(junctions, new WindowsTreeService(), new ConfigurationService(), new TaskResolver(), new JournalStore());
+
+        var result = await engine.ExecuteAsync(Request(workspace, OperationKind.Repair));
+
+        Assert.IsTrue(result.Success, result.Message);
+        var row = result.Tasks.Single();
+        Assert.AreEqual("REPAIR_MERGED", row.Status, row.Detail);
+        Assert.AreEqual("Committed", new JournalStore().Load(row.JournalPath)!.State);
+        Assert.AreEqual(destination, junctions.Inspect(source).Target);
+        Assert.IsTrue(File.Exists(System.IO.Path.Combine(destination, "a.txt")));
+    }
+
+    [TestMethod]
+    public async Task SourceRewrittenDuringCopyFailsClosedWithRecoveryGuidance()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "source")).FullName;
+        var destination = System.IO.Path.Combine(folder.Path, "destination");
+        var template = System.IO.Path.Combine(source, "comps-model-template.xlsx");
+        File.WriteAllText(template, "original");
+        var workspace = new PortableWorkspace(folder.Path);
+        workspace.Initialize(Configuration(source, destination, "csaver-test-guard-9f2a"));
+        var junctions = new FakeJunctionService();
+        var trees = new RewriteSourceAfterCopyTreeService(template, "rewritten-by-the-app-while-copying");
+        var engine = new NativeOperationEngine(junctions, trees, new ConfigurationService(), new TaskResolver(), new JournalStore());
+
+        var result = await engine.ExecuteAsync(Request(workspace));
+
+        Assert.IsFalse(result.Success, result.Message);
+        var row = result.Tasks.Single();
+        Assert.AreEqual("FAIL_TRANSACTION", row.Status);
+        StringAssert.Contains(row.Detail, "Copy verification failed");
+        StringAssert.Contains(row.Detail, "comps-model-template.xlsx");
+        StringAssert.Contains(row.Detail, "csaver-test-guard-9f2a");
+        StringAssert.Contains(row.Detail, "Recover Incomplete Transaction");
+        StringAssert.Contains(row.Detail, "Do not use Repair");
+        Assert.AreEqual("original", File.ReadAllText(System.IO.Path.Combine(destination, "comps-model-template.xlsx")),
+            "Fail-closed verification must not recopy files that changed during the copy.");
+        Assert.IsFalse(junctions.Inspect(source).IsJunction, "The source must stay an ordinary directory.");
+        var journalPath = Directory.GetFiles(System.IO.Path.Combine(folder.Path, ".csaver-journal"), "forward-*.json").Single();
+        var journalText = File.ReadAllText(journalPath);
+        Assert.IsFalse(journalText.Contains("\"SourceSnapshot\": {") || journalText.Contains("\"DestinationSnapshot\": {"),
+            "A copy verification failure must stay eligible for Recover Incomplete Transaction.");
+        Assert.AreEqual("RecoveryRequired", new JournalStore().Load(journalPath)!.State);
+    }
+
+    private static string Configuration(string source, string destination, string guard = "") =>
         "{\"DestRoot\":" + System.Text.Json.JsonSerializer.Serialize(System.IO.Path.GetDirectoryName(destination)) +
         ",\"Tasks\":[{\"TaskId\":\"test\",\"Group\":\"Test\",\"Source\":" + System.Text.Json.JsonSerializer.Serialize(source) +
-        ",\"Dest\":" + System.Text.Json.JsonSerializer.Serialize(destination) + ",\"Guard\":\"\"}]}";
+        ",\"Dest\":" + System.Text.Json.JsonSerializer.Serialize(destination) +
+        ",\"Guard\":" + System.Text.Json.JsonSerializer.Serialize(guard) + "}]}";
 
     private static OperationRequest Request(PortableWorkspace workspace, OperationKind kind = OperationKind.Migrate) => new()
     {
@@ -871,5 +952,32 @@ internal sealed class FakeJunctionService : IJunctionService
         var key = System.IO.Path.GetFullPath(path).TrimEnd('\\');
         if (!links.Remove(key)) throw new IOException("Not a Junction.");
         Directory.Delete(path, false);
+    }
+}
+
+// Simulates an application rewriting one of its own template files immediately after
+// CopyPreserving finishes, so the post-copy snapshot sees content the destination lacks.
+internal sealed class RewriteSourceAfterCopyTreeService(string file, string rewritten) : ITreeService
+{
+    private readonly WindowsTreeService inner = new();
+    private bool applied;
+
+    public DirectoryStatistics GetStatistics(string root, CancellationToken cancellationToken = default) =>
+        inner.GetStatistics(root, cancellationToken);
+
+    public DirectoryScanResult GetStatisticsSkippingReparsePoints(string root, IReadOnlyCollection<string> trustedReparsePoints, CancellationToken cancellationToken = default) =>
+        inner.GetStatisticsSkippingReparsePoints(root, trustedReparsePoints, cancellationToken);
+
+    public DirectorySnapshot CaptureSnapshot(string root, CancellationToken cancellationToken = default) =>
+        inner.CaptureSnapshot(root, cancellationToken);
+
+    public SnapshotComparison Compare(DirectorySnapshot expected, DirectorySnapshot actual, bool allowDestinationOnly, bool ignoreLastAccess = true) =>
+        inner.Compare(expected, actual, allowDestinationOnly, ignoreLastAccess);
+
+    public void CopyPreserving(string source, string destination, IProgress<OperationProgress>? progress = null,
+        string operationId = "", string taskId = "", CancellationToken cancellationToken = default)
+    {
+        inner.CopyPreserving(source, destination, progress, operationId, taskId, cancellationToken);
+        if (!applied) { applied = true; File.WriteAllText(file, rewritten); }
     }
 }
