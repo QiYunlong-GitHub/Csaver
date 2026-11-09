@@ -125,7 +125,9 @@ public sealed class TaskInspectionService(IJunctionService junctions, ITreeServi
         }
     }
 
-    private static bool IsBusy(string expression)
+    // Public so the migration engine can re-check the same Guard expression while a
+    // long copy is in progress; preflight alone cannot catch an app that starts later.
+    public static bool IsBusy(string expression)
     {
         var regex = new Regex(expression, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         foreach (var process in Process.GetProcesses())

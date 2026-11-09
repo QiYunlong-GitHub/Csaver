@@ -15,6 +15,13 @@ public sealed class NativeOperationEngine : IOperationEngine
     private readonly TaskResolver resolver;
     private readonly JournalStore journals;
 
+    // A 350+ MiB application profile can take minutes to copy. Refuse to start while the
+    // source is still changing, and re-check periodically during the copy. Both are
+    // early-abort guards only: the final snapshot comparison stays the authoritative check.
+    private const int StabilityMaxSamples = 3;
+    private static readonly TimeSpan StabilityPollInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan CopyStabilityCheckInterval = TimeSpan.FromSeconds(5);
+
     public NativeOperationEngine(IJunctionService junctions, ITreeService trees, ConfigurationService configurations, TaskResolver resolver, JournalStore journals)
     {
         this.junctions = junctions;
@@ -302,23 +309,93 @@ public sealed class NativeOperationEngine : IOperationEngine
     // command to run next (recovery, not repair) and whether recovery is still possible.
     private static string BuildInstabilityMessage(ResolvedMigrationTask task, SnapshotComparison comparison, string prefix, bool sourceStillChanging, bool snapshotEvidence)
     {
-        var details = string.Join("; ", comparison.Details.Take(5));
+        var differences = string.Join("; ", comparison.Details.Take(5));
         var remaining = comparison.Details.Count > 5 ? $" (+{comparison.Details.Count - 5} more differences)" : string.Empty;
         var changedEntries = string.Join(", ", comparison.Details
             .Select(x => x.Contains(':') ? x[(x.LastIndexOf(':') + 1)..].Trim() : x.Trim())
             .Where(x => x.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(5));
+        var cause = sourceStillChanging
+            ? "The source directory is still being modified; a second source snapshot changed again."
+            : "The source directory changed during the copying window and is now stable again, so the destination no longer matches it.";
+        var guidance = snapshotEvidence
+            ? "This journal already contains snapshot evidence, so automatic recovery will be refused. Keep the source, destination, and journal intact and follow the user guide to resolve the transaction manually."
+            : UnstableSourceGuidance(task);
+        return $"{prefix}: {differences}{remaining} | MismatchCount={comparison.MismatchCount}; MissingCount={comparison.MissingCount}; changedEntries={changedEntries}. {cause} {guidance}";
+    }
+
+    private static string UnstableSourceGuidance(ResolvedMigrationTask task)
+    {
         var guardHint = string.IsNullOrWhiteSpace(task.Guard)
             ? "Close every application writing to the source directory, including tray and background helpers."
             : $"Close the application matching Guard '{task.Guard}', including its tray and background helpers.";
-        var cause = sourceStillChanging
-            ? "The source directory was rewritten while Csaver was copying it; a second source snapshot changed again."
-            : "The source directory was rewritten while Csaver was copying it (or its metadata did not survive the copy); the source was not stable.";
-        var recovery = snapshotEvidence
-            ? "This journal already contains snapshot evidence, so automatic recovery will be refused. Keep the source, destination, and journal intact and follow the user guide to resolve the transaction manually."
-            : "This transaction has no snapshot evidence yet. Run Recover Incomplete Transaction, then Preview Migration and Run Migration again. Do not use Repair for a copy verification failure; Repair is for a broken Junction.";
-        return $"{prefix}: {details}{remaining} | MismatchCount={comparison.MismatchCount}; MissingCount={comparison.MissingCount}; changedEntries={changedEntries}. {cause} {guardHint} {recovery} The source was left intact and no Junction was created.";
+        return $"{guardHint} If this keeps recurring, migrate in Windows Safe Mode, where third-party startup apps and background services are not loaded; the user guide gives detailed steps to enter and exit Safe Mode. This transaction has no snapshot evidence yet. Run Recover Incomplete Transaction, then Preview Migration and Run Migration again. Do not use Repair for a copy verification failure; Repair is for a broken Junction. The source was left intact and no Junction was created.";
+    }
+
+    private static string BuildCopyTimeInstabilityMessage(ResolvedMigrationTask task, string prefix, string cause) =>
+        $"{prefix}: {cause} Copying stopped before the cutover; no files were recopied and no difference was ignored. {UnstableSourceGuidance(task)}";
+
+    // Runs while the journal is in Copying, before any file is copied and before any
+    // snapshot is attached. Consecutive identical source snapshots are required.
+    private void WaitForStableSource(OperationRequest request, ResolvedMigrationTask task, IProgress<OperationProgress>? progress, CancellationToken cancellationToken)
+    {
+        var baseline = trees.CaptureSnapshot(task.Source, cancellationToken);
+        SnapshotComparison? lastComparison = null;
+        for (var sample = 1; sample <= StabilityMaxSamples; sample++)
+        {
+            cancellationToken.WaitHandle.WaitOne(StabilityPollInterval);
+            cancellationToken.ThrowIfCancellationRequested();
+            progress?.Report(Progress(request, task, "Stabilizing", $"Waiting for the source to stop changing (sample {sample}/{StabilityMaxSamples})."));
+            var current = trees.CaptureSnapshot(task.Source, cancellationToken);
+            lastComparison = trees.Compare(baseline, current, allowDestinationOnly: false);
+            if (lastComparison.Success) return;
+            baseline = current;
+        }
+        throw new IOException(BuildInstabilityMessage(task, lastComparison!, "Source is not stable before copying", sourceStillChanging: true, snapshotEvidence: false));
+    }
+
+    private string? DetectCopyTimeInstability(ResolvedMigrationTask task, DirectoryScanResult baseline, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(task.Guard) && TaskInspectionService.IsBusy(task.Guard))
+                return BuildCopyTimeInstabilityMessage(task, "Guard process appeared during copying",
+                    $"Guard '{task.Guard}' is running while Csaver is copying.");
+        }
+        catch (ArgumentException) { /* GuardRegexInvalid is already reported by configuration validation. */ }
+        try
+        {
+            var current = trees.GetStatisticsSkippingReparsePoints(task.Source, task.TrustedReparsePoints, cancellationToken);
+            if (current.FileCount != baseline.FileCount || current.Bytes != baseline.Bytes)
+                return BuildCopyTimeInstabilityMessage(task, "Source changed during copying",
+                    $"Source statistics changed during copying (files {baseline.FileCount} -> {current.FileCount}, bytes {baseline.Bytes} -> {current.Bytes}).");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A transient scan failure is not evidence of an unstable source; the final
+            // snapshot comparison remains the authoritative fail-closed check.
+        }
+        return null;
+    }
+
+    // CopyPreserving reports progress every 100 files. Wrapping that callback gives a
+    // cheap periodic hook without changing the ITreeService signature or its three
+    // implementations. Throwing IOException here leaves the journal in Copying, so it
+    // becomes RecoveryRequired with no snapshot evidence and stays recoverable.
+    private sealed class StabilityCheckProgress(IProgress<OperationProgress>? inner, Func<string?> check) : IProgress<OperationProgress>
+    {
+        private DateTime lastCheckUtc = DateTime.MinValue;
+
+        public void Report(OperationProgress value)
+        {
+            inner?.Report(value);
+            var now = DateTime.UtcNow;
+            if (now - lastCheckUtc < CopyStabilityCheckInterval) return;
+            lastCheckUtc = now;
+            var instability = check();
+            if (instability is not null) throw new IOException(instability);
+        }
     }
 
     private static void EnsureSourceMovable(string source, CancellationToken cancellationToken)
@@ -418,8 +495,12 @@ public sealed class NativeOperationEngine : IOperationEngine
                 // Fail before copying and before attaching snapshots to the journal, so a
                 // locked source stays recoverable instead of becoming a post-cutover refusal.
                 EnsureSourceMovable(task.Source, cancellationToken);
+                progress?.Report(Progress(request, task, "Stabilizing", "Waiting for the source to stop changing before copying."));
+                WaitForStableSource(request, task, progress, cancellationToken);
+                var baselineStats = trees.GetStatisticsSkippingReparsePoints(task.Source, task.TrustedReparsePoints, cancellationToken);
+                var stabilityProgress = new StabilityCheckProgress(progress, () => DetectCopyTimeInstability(task, baselineStats, cancellationToken));
                 progress?.Report(Progress(request, task, "Copying", "Copying without deleting destination-only data."));
-                trees.CopyPreserving(task.Source, task.Destination, progress, request.OperationId, task.TaskId, cancellationToken);
+                trees.CopyPreserving(task.Source, task.Destination, stabilityProgress, request.OperationId, task.TaskId, cancellationToken);
                 journals.Transition(journalPath, journal, "Copied");
                 var sourceSnapshot = trees.CaptureSnapshot(task.Source, cancellationToken);
                 var destinationSnapshot = trees.CaptureSnapshot(task.Destination, cancellationToken);
