@@ -110,3 +110,81 @@ fsutil reparsepoint query "$env:USERPROFILE\.workbuddy"
 4. Select only `doubao-local` and run **Recover Incomplete Transaction**, then **Preview Migration** and **Run Migration**. Use **Repair** only when the source really is a broken Junction or a real directory left behind by an application update.
 5. If the failure repeats, the new error names the changed entries and the `Guard` value (`doubao`). Close that application and retry. Csaver will never recopy the changed files for you or weaken the check to make verification pass.
 6. If a journal already contains snapshot evidence, automatic recovery is refused. Keep both trees and the journal intact and resolve the transaction manually as described in the recovery section above.
+
+## Why the Doubao failure repeats, and what current builds do
+
+Current builds add two **early-abort guards** before and during the copy; neither relaxes verification:
+
+- `Stabilizing` stage: before any file is copied, Csaver requires consecutive identical structural snapshots of the source. If the source keeps changing, it stops with `Source is not stable before copying` — no file is copied and no staging folder is created.
+- Copy-time re-check: periodically (on copy progress, at most every 5 seconds) Csaver re-checks the `Guard` process and the source's file/byte counts. If the application appears or the source statistics change, it stops with `Guard process appeared during copying` or `Source changed during copying`, before cutover.
+- The final snapshot comparison is unchanged and strictly fail-closed: no difference is ignored and no file is recopied. Every early abort happens while the journal is still `Copying`, before snapshot evidence is attached, so **Recover Incomplete Transaction** remains available.
+
+If closing the application still does not stop background helpers from rewriting `.skills` templates, use Windows Safe Mode.
+
+## Migrating in Windows Safe Mode (detailed steps)
+
+Safe Mode starts Windows with a minimal driver and service set: third-party startup apps, background updaters, and most antivirus minifilters are not loaded, so the source directory stays still. The self-contained `Csaver.exe` needs no preinstalled .NET runtime, and NTFS Junctions plus UAC elevation both work there.
+
+### Before you start
+
+1. Use the current release ZIP. Keep `config/` and `data/` next to `Csaver.exe`; do not delete journals, `_repair_conflicts`, or `_repair_backup`.
+2. Note the `DestRoot` volume (for example `D:`). Fixed NTFS data volumes stay mounted in Safe Mode; removable or BitLocker-locked volumes may not.
+3. A `RecoveryRequired` journal blocks a new migration. Run **Recover Incomplete Transaction** for the failed task before entering Safe Mode, or immediately after booting into it.
+4. Plain Safe Mode is enough for a purely local migration. Choose **Safe Mode with Networking** only if you need network access.
+
+### Enter Safe Mode (Windows 10 / 11, boot menu — one-shot)
+
+1. Open **Settings → System → Recovery** (Windows 10: **Update & Security → Recovery**).
+2. Under **Advanced startup**, click **Restart now**. The PC boots into the Windows Recovery Environment.
+3. Choose **Troubleshoot → Advanced options → Startup Settings → Restart**.
+4. After the next restart, press `4` / `F4` for **Enable Safe Mode**, or `5` / `F5` for **Enable Safe Mode with Networking**.
+5. Sign in with an administrator account. "Safe Mode" appears in the screen corners.
+
+### Alternative: msconfig (stays in Safe Mode until undone)
+
+1. Press `Win + R`, type `msconfig`, press Enter.
+2. On the **Boot** tab, tick **Safe boot**, choose **Minimal** (or **Network**), click **OK**, then **Restart**.
+
+### Alternative: elevated command line
+
+```powershell
+bcdedit /set {current} safeboot minimal
+shutdown /r /t 0
+```
+
+### Perform the migration
+
+1. Copy `Csaver.exe` with `config/` and `data/` to a folder on a fixed local volume.
+2. Right-click `Csaver.exe` → **Run as administrator** and accept the UAC prompt.
+3. Select only the affected task (for example `doubao-local`), run **Recover Incomplete Transaction** if a journal is pending, then **Preview Migration** and **Run Migration**. The three checks above now protect the whole copy.
+4. Verify the Junction before leaving Safe Mode:
+
+   ```powershell
+   Get-Item -LiteralPath "$env:LOCALAPPDATA\Doubao" -Force | Select-Object FullName, Attributes, LinkType, Target
+   ```
+
+   `LinkType` must be `Junction` and `Target` must be the `DestRoot` path.
+
+### Exit Safe Mode (mandatory)
+
+- **Boot menu (`4`/`F4`/`5`/`F5`)**: Safe Mode is one-shot; just restart normally.
+
+  ```powershell
+  shutdown /r /t 0
+  ```
+
+- **msconfig**: `Win + R` → `msconfig` → **Boot** tab → untick **Safe boot** → **OK** → **Restart**.
+- **bcdedit**: open an elevated terminal and run:
+
+  ```powershell
+  bcdedit /deletevalue {current} safeboot
+  shutdown /r /t 0
+  ```
+
+- Confirm Windows boots normally (no "Safe Mode" corners), then start the application. It keeps using the original path, now backed by the Junction.
+
+### Safe Mode troubleshooting
+
+- **Stuck in a Safe Mode loop**: boot to Windows Recovery Environment → **Troubleshoot → Advanced options → Command Prompt**, run `bcdedit /deletevalue {default} safeboot`, then restart.
+- **`D:` not visible**: move the workspace and `DestRoot` to a fixed NTFS volume, or unlock BitLocker first.
+- **UAC elevation fails**: sign in with a local administrator account; Safe Mode does not remove the administrator requirement for creating a Junction.

@@ -110,3 +110,81 @@ fsutil reparsepoint query "$env:USERPROFILE\.workbuddy"
 4. 只勾选 `doubao-local`，执行 **恢复未完成事务**，再执行「预览迁移」与「运行迁移」。只有当源确实是断链联接、或应用更新后留下的真实目录时，才使用「运行修复」。
 5. 若再次失败，新错误会列出变化条目和 `Guard` 值（`doubao`）；关闭该应用后重试。Csaver 不会替你重拷变化文件，也不会为了让校验通过而放宽检查。
 6. 若 journal 已含快照证据，自动恢复会被拒绝。请保持两棵树和 journal 原样，按上文的恢复章节人工处置。
+
+## 豆包失败为何反复出现，以及当前版本的处理
+
+当前版本在复制前与复制期间新增了两道**提前中止**防线，两者都不放宽校验：
+
+- `Stabilizing`（稳定等待）阶段：在复制任何文件之前，Csaver 要求连续两次源目录结构快照完全一致。源若持续变化，会以 `Source is not stable before copying` 中止——不复制任何文件、不创建暂存目录。
+- 复制期复检：周期性（随复制进度上报触发，最多每 5 秒一次）重新检查 `Guard` 进程以及源目录的文件数/总字节数。应用出现或统计变化时，会在切换前以 `Guard process appeared during copying` 或 `Source changed during copying` 中止。
+- 复制后的最终快照对比完全不变，仍严格 fail-closed：不忽略任何差异、不自动重拷。所有提前中止都发生在 journal 仍处于 `Copying`、尚未写入快照证据时，因此 **恢复未完成事务** 依然可用。
+
+如果彻底退出应用仍挡不住后台辅助进程改写 `.skills` 模板，请使用 Windows 安全模式。
+
+## 在 Windows 安全模式下迁移（详细步骤）
+
+安全模式只加载最小驱动与服务集：第三方自启动程序、后台更新服务以及多数杀毒过滤驱动都不会加载，源目录因此能保持静止。Csaver 是自包含单文件 exe，无需预装 .NET 运行时；NTFS 目录联接与 UAC 提权在安全模式下均可用。
+
+### 开始前
+
+1. 使用当前发布包。让 `config/` 与 `data/` 和 `Csaver.exe` 放在一起；不要删除 journal、`_repair_conflicts` 或 `_repair_backup`。
+2. 记下 `DestRoot` 所在盘（例如 `D:`）。固定的 NTFS 数据盘在安全模式下仍会挂载；可移动盘或被 BitLocker 锁定的盘可能不可见。
+3. `RecoveryRequired` journal 会阻止新迁移。进入安全模式前（或进入后立即）先对该任务执行 **恢复未完成事务**。
+4. 纯本地迁移用普通安全模式即可；只有需要网络时才选「带网络的安全模式」。
+
+### 进入安全模式（Windows 10 / 11 启动菜单，一次性）
+
+1. 打开 **设置 → 系统 → 恢复**（Windows 10 为 **更新和安全 → 恢复**）。
+2. 在 **高级启动** 下点击 **立即重新启动**，电脑会进入 Windows 恢复环境。
+3. 依次选择 **疑难解答 → 高级选项 → 启动设置 → 重启**。
+4. 再次重启后按 `4` / `F4` 选择 **启用安全模式**，或按 `5` / `F5` 选择 **启用带网络的安全模式**。
+5. 用管理员账户登录，屏幕四角会显示「安全模式」。
+
+### 备选：msconfig（会一直保持安全模式，直到手动取消）
+
+1. 按 `Win + R`，输入 `msconfig`，回车。
+2. 在 **引导** 选项卡勾选 **安全引导**，选择 **最小**（需要网络则选 **网络**），点 **确定** 后 **重启**。
+
+### 备选：管理员命令行
+
+```powershell
+bcdedit /set {current} safeboot minimal
+shutdown /r /t 0
+```
+
+### 执行迁移
+
+1. 把 `Csaver.exe` 连同 `config/`、`data/` 复制到固定本地磁盘上的目录。
+2. 右键 `Csaver.exe` → **以管理员身份运行**，接受 UAC 提示。
+3. 只勾选受影响的任务（例如 `doubao-local`）；若 journal 仍待处理先执行 **恢复未完成事务**，再执行「预览迁移」与「运行迁移」。上述三道检查会覆盖整个复制过程。
+4. 退出安全模式前先验证联接：
+
+   ```powershell
+   Get-Item -LiteralPath "$env:LOCALAPPDATA\Doubao" -Force | Select-Object FullName, Attributes, LinkType, Target
+   ```
+
+   `LinkType` 必须是 `Junction`，`Target` 必须是 `DestRoot` 下的目标路径。
+
+### 退出安全模式（必须执行）
+
+- **启动菜单（`4`/`F4`/`5`/`F5`）**：该方式是一次性的，正常重启即可。
+
+  ```powershell
+  shutdown /r /t 0
+  ```
+
+- **msconfig**：`Win + R` → `msconfig` → **引导** 选项卡 → 取消勾选 **安全引导** → **确定** → **重启**。
+- **bcdedit**：在管理员终端执行：
+
+  ```powershell
+  bcdedit /deletevalue {current} safeboot
+  shutdown /r /t 0
+  ```
+
+- 确认 Windows 已正常启动（四角不再显示「安全模式」），再启动应用。应用仍按原路径读写，底层已由联接指向新位置。
+
+### 安全模式常见问题
+
+- **反复进入安全模式**：进入 Windows 恢复环境 → **疑难解答 → 高级选项 → 命令提示符**，执行 `bcdedit /deletevalue {default} safeboot` 后重启。
+- **看不到 `D:` 盘**：把工作目录和 `DestRoot` 换到固定的 NTFS 卷，或先解锁 BitLocker。
+- **UAC 提权失败**：改用本地管理员账户登录；安全模式不会免除创建联接所需的管理员权限。
