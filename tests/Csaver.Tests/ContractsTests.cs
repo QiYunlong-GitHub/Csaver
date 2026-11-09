@@ -913,6 +913,90 @@ public sealed class MigrationTransactionTests
         Assert.AreEqual("RecoveryRequired", new JournalStore().Load(journalPath)!.State);
     }
 
+    [TestMethod]
+    public async Task StableSourceCommitsAndReportsStabilizingStage()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "source")).FullName;
+        var destination = System.IO.Path.Combine(folder.Path, "destination");
+        File.WriteAllText(System.IO.Path.Combine(source, "a.txt"), "stable-data");
+        var workspace = new PortableWorkspace(folder.Path);
+        workspace.Initialize(Configuration(source, destination));
+        var junctions = new FakeJunctionService();
+        var engine = new NativeOperationEngine(junctions, new WindowsTreeService(), new ConfigurationService(), new TaskResolver(), new JournalStore());
+        var stages = new List<string>();
+
+        var result = await engine.ExecuteAsync(Request(workspace), new RelayProgress(p => stages.Add(p.Stage)));
+
+        Assert.IsTrue(result.Success, result.Message);
+        var row = result.Tasks.Single();
+        Assert.AreEqual("OK", row.Status, row.Detail);
+        CollectionAssert.Contains(stages, "Stabilizing", "The stability wait must be reported before copying.");
+        Assert.IsTrue(junctions.Inspect(source).IsJunction);
+        Assert.AreEqual("stable-data", File.ReadAllText(System.IO.Path.Combine(destination, "a.txt")));
+    }
+
+    [TestMethod]
+    public async Task SourceThatNeverStabilizesAbortsBeforeAnyFileIsCopied()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "source")).FullName;
+        var destination = System.IO.Path.Combine(folder.Path, "destination");
+        File.WriteAllText(System.IO.Path.Combine(source, "a.txt"), "data");
+        var workspace = new PortableWorkspace(folder.Path);
+        workspace.Initialize(Configuration(source, destination, "csaver-test-guard-9f2a"));
+        var junctions = new FakeJunctionService();
+        var engine = new NativeOperationEngine(junctions, new NeverStableTreeService(), new ConfigurationService(), new TaskResolver(), new JournalStore());
+
+        var result = await engine.ExecuteAsync(Request(workspace));
+
+        Assert.IsFalse(result.Success, result.Message);
+        var row = result.Tasks.Single();
+        Assert.AreEqual("FAIL_TRANSACTION", row.Status);
+        StringAssert.Contains(row.Detail, "Source is not stable before copying");
+        StringAssert.Contains(row.Detail, "csaver-test-guard-9f2a");
+        StringAssert.Contains(row.Detail, "Safe Mode");
+        StringAssert.Contains(row.Detail, "Recover Incomplete Transaction");
+        Assert.IsFalse(Directory.Exists(destination), "No file may be copied before the source stabilizes.");
+        Assert.IsFalse(junctions.Inspect(source).IsJunction);
+        var journalPath = Directory.GetFiles(System.IO.Path.Combine(folder.Path, ".csaver-journal"), "forward-*.json").Single();
+        var journalText = File.ReadAllText(journalPath);
+        Assert.IsFalse(journalText.Contains("\"SourceSnapshot\": {") || journalText.Contains("\"DestinationSnapshot\": {"));
+        Assert.AreEqual("RecoveryRequired", new JournalStore().Load(journalPath)!.State);
+    }
+
+    [TestMethod]
+    public async Task SourceChangeDetectedDuringCopyAbortsBeforeCutover()
+    {
+        using var folder = new TempFolder();
+        var source = Directory.CreateDirectory(System.IO.Path.Combine(folder.Path, "source")).FullName;
+        var destination = System.IO.Path.Combine(folder.Path, "destination");
+        for (var i = 0; i < 120; i++) File.WriteAllText(System.IO.Path.Combine(source, $"{i:D3}.txt"), "original");
+        var workspace = new PortableWorkspace(folder.Path);
+        workspace.Initialize(Configuration(source, destination));
+        var junctions = new FakeJunctionService();
+        var engine = new NativeOperationEngine(junctions, new MutatingDuringCopyTreeService(System.IO.Path.Combine(source, "000.txt")), new ConfigurationService(), new TaskResolver(), new JournalStore());
+
+        var result = await engine.ExecuteAsync(Request(workspace));
+
+        Assert.IsFalse(result.Success, result.Message);
+        var row = result.Tasks.Single();
+        Assert.AreEqual("FAIL_TRANSACTION", row.Status);
+        StringAssert.Contains(row.Detail, "Source changed during copying");
+        StringAssert.Contains(row.Detail, "Safe Mode");
+        StringAssert.Contains(row.Detail, "Recover Incomplete Transaction");
+        Assert.IsFalse(row.Detail.Contains("A task was canceled"), "An internal abort must not degrade to a generic cancellation message.");
+        Assert.IsFalse(junctions.Inspect(source).IsJunction, "Cutover must not be reached.");
+        var copiedFiles = Directory.GetFiles(destination, "*.txt");
+        Assert.IsTrue(copiedFiles.Length > 0, "The abort must happen after copying started.");
+        foreach (var copied in copiedFiles)
+            Assert.AreEqual("original", File.ReadAllText(copied), "No changed source file may be recopied.");
+        var journalPath = Directory.GetFiles(System.IO.Path.Combine(folder.Path, ".csaver-journal"), "forward-*.json").Single();
+        var journalText = File.ReadAllText(journalPath);
+        Assert.IsFalse(journalText.Contains("\"SourceSnapshot\": {") || journalText.Contains("\"DestinationSnapshot\": {"));
+        Assert.AreEqual("RecoveryRequired", new JournalStore().Load(journalPath)!.State);
+    }
+
     private static string Configuration(string source, string destination, string guard = "") =>
         "{\"DestRoot\":" + System.Text.Json.JsonSerializer.Serialize(System.IO.Path.GetDirectoryName(destination)) +
         ",\"Tasks\":[{\"TaskId\":\"test\",\"Group\":\"Test\",\"Source\":" + System.Text.Json.JsonSerializer.Serialize(source) +
@@ -979,5 +1063,61 @@ internal sealed class RewriteSourceAfterCopyTreeService(string file, string rewr
     {
         inner.CopyPreserving(source, destination, progress, operationId, taskId, cancellationToken);
         if (!applied) { applied = true; File.WriteAllText(file, rewritten); }
+    }
+}
+
+internal sealed class RelayProgress(Action<OperationProgress> report) : IProgress<OperationProgress>
+{
+    public void Report(OperationProgress value) => report(value);
+}
+
+// Every source snapshot differs from the previous one, so the pre-copy stability wait
+// must time out without ever starting CopyPreserving.
+internal sealed class NeverStableTreeService : ITreeService
+{
+    public DirectoryStatistics GetStatistics(string root, CancellationToken cancellationToken = default) => new(0, 0);
+
+    public DirectoryScanResult GetStatisticsSkippingReparsePoints(string root, IReadOnlyCollection<string> trustedReparsePoints, CancellationToken cancellationToken = default) =>
+        new(0, 0, [], []);
+
+    public DirectorySnapshot CaptureSnapshot(string root, CancellationToken cancellationToken = default) =>
+        new() { Root = root };
+
+    public SnapshotComparison Compare(DirectorySnapshot expected, DirectorySnapshot actual, bool allowDestinationOnly, bool ignoreLastAccess = true) =>
+        new() { Success = false, MismatchCount = 1, Details = ["simulated ongoing change: a.txt"] };
+
+    public void CopyPreserving(string source, string destination, IProgress<OperationProgress>? progress = null,
+        string operationId = "", string taskId = "", CancellationToken cancellationToken = default) =>
+        throw new InvalidOperationException("Copying must not start while the source is unstable.");
+}
+
+// Rewrites a source file just before the first progress report (after ~100 files), so
+// the copy-time stability hook sees the changed statistics and aborts before cutover.
+internal sealed class MutatingDuringCopyTreeService(string mutateFile) : ITreeService
+{
+    private readonly WindowsTreeService inner = new();
+    private bool mutated;
+
+    public DirectoryStatistics GetStatistics(string root, CancellationToken cancellationToken = default) =>
+        inner.GetStatistics(root, cancellationToken);
+
+    public DirectoryScanResult GetStatisticsSkippingReparsePoints(string root, IReadOnlyCollection<string> trustedReparsePoints, CancellationToken cancellationToken = default) =>
+        inner.GetStatisticsSkippingReparsePoints(root, trustedReparsePoints, cancellationToken);
+
+    public DirectorySnapshot CaptureSnapshot(string root, CancellationToken cancellationToken = default) =>
+        inner.CaptureSnapshot(root, cancellationToken);
+
+    public SnapshotComparison Compare(DirectorySnapshot expected, DirectorySnapshot actual, bool allowDestinationOnly, bool ignoreLastAccess = true) =>
+        inner.Compare(expected, actual, allowDestinationOnly, ignoreLastAccess);
+
+    public void CopyPreserving(string source, string destination, IProgress<OperationProgress>? progress = null,
+        string operationId = "", string taskId = "", CancellationToken cancellationToken = default)
+    {
+        IProgress<OperationProgress>? wrapped = progress is null ? null : new RelayProgress(p =>
+        {
+            if (!mutated) { mutated = true; File.AppendAllText(mutateFile, "-rewritten-by-app"); }
+            progress.Report(p);
+        });
+        inner.CopyPreserving(source, destination, wrapped, operationId, taskId, cancellationToken);
     }
 }
